@@ -1,46 +1,975 @@
-# Residential HEMS Optimization with V2G and V2H Integration
+!pip install pandas pyomo highspy openpyxl
 
-A Mixed-Integer Linear Programming (MILP) optimization model for residential
-Home Energy Management Systems (HEMS), integrating photovoltaic generation,
-stationary battery storage, and Vehicle-to-Everything (V2X) capable electric
-vehicles with deferrable and dimmable load scheduling.
+from google.colab import drive
+drive.mount('/content/drive', force_remount=True)
 
-## Overview
+import os
+os.sync()
 
-This model minimizes the total operational cost of a residential household
-over a configurable time horizon by optimally scheduling:
+# Copy Excel locally to avoid Drive cache
+!cp "/content/drive/My Drive/Colab Notebooks/carregamento_carro.xlsx" "/content/input.xlsx"
 
-- PV generation allocation across loads, battery, EVs, and grid export
-- Stationary battery charge/discharge cycles
-- Electric vehicles with V2G and V2H capabilities and charger assignment
-- Deferrable loads (Type 1: non-interruptible, Type 2: interruptible)
-- Dimmable loads with adjustable power levels
-- Fixed loads with predefined consumption profiles
+import glob
+import pandas as pd
+import pyomo.environ as pe
+from pyomo.environ import Var, Objective, Constraint, minimize, SolverFactory
+import re
 
 
-## Usage
 
-The script is designed to run on **Google Colab** with input data stored
-in a multi-sheet Excel file on Google Drive. To run it:
-
-1. Mount your Google Drive in Colab
-2. Place your input Excel file at the expected path
-3. Run the script
-
-To run locally, replace the Drive mount and file path sections with
-your local paths.
+file_pathh = '/content/input.xlsx'
+df_dados = pd.read_excel(file_pathh, sheet_name=0)
 
 
-## Input Data Format
+def extract_id(name):
+    m = re.match(r'\s*(\d+)', str(name))
+    if not m:
+        raise ValueError(f"Cannot extract LoadID from '{name}'")
+    return int(m.group(1))
 
-The model expects a multi-sheet Excel file with the following structure:
+# Ler primeira folha de dados
+vetor_horas = df_dados.iloc[:, 0].astype(int).tolist()
+vetor_precos = df_dados.iloc[:, 2].astype(float).tolist()
+vetor_energiaPV = df_dados.iloc[:, 1].astype(float).tolist()
+sell_price_data = df_dados.iloc[:, 7].ffill().tolist()
+# Parâmetros da bateria de armazenamento
+bateria_capacidade_max_value = float(df_dados.iloc[0, 8])
+bateria_potencia_max_value = float(df_dados.iloc[0, 9])
+penalização_bateria_arm = float(df_dados.iloc[0, 5])
 
-| Sheet | Contents |
-|-------|----------|
-| 0 | Time horizon, PV generation, electricity prices, battery parameters |
-| 1 | Load types, total energy, and duration |
-| 2 | Base consumption profiles (fixed and dimmable loads) |
-| 3 | Deferrable load availability windows |
-| 4 | Comfort penalty weights |
-| 5 | Dimmable load reduction limits |
-| 6+ | One sheet per EV (SoC, availability, driving consumption, limits) |
+
+# Parâmetros
+num_veiculos = int(df_dados.loc[0, "Número de veículos"])
+num_carregadores = int(df_dados.loc[0, "Número de Carregadores"])
+
+
+
+print("Número de veículos:", num_veiculos)
+print("Número de carregadores:", num_carregadores)
+epsilon = 1e-6
+
+# Read NonDeferrable Loads (sheet 1)
+
+
+# SHEET 1: TYPES
+COL_LOAD = 0
+COL_TYPE = 1
+COL_TOTAL_ENERGY = 2
+COL_DURATION = 3
+
+df_types = pd.read_excel(file_pathh, sheet_name=1)
+COL_LOADID = 4  # new column index
+
+load_id = {
+    row.iloc[COL_LOAD]: (
+        int(row.iloc[COL_LOADID])
+        if not pd.isna(row.iloc[COL_LOADID])
+        else None
+    )
+    for _, row in df_types.iterrows()
+}
+
+df_types.columns = [c.strip() for c in df_types.columns]
+df_types = df_types.rename(columns={
+    "Energy (kW)": "Total_Energy",
+    "Duration (h)": "Duration"
+    })
+load_type = {
+    row.iloc[COL_LOAD]: int(row.iloc[COL_TYPE])
+    for _, row in df_types.iterrows()
+}
+
+
+DL1 = [load_id[l] for l, t in load_type.items()
+       if t == 1 and load_id[l] is not None]
+
+DL2 = [load_id[l] for l, t in load_type.items()
+       if t == 2 and load_id[l] is not None]
+
+DIM = [load_id[l] for l, t in load_type.items()
+       if t == 4 and load_id[l] is not None]
+
+id_to_name = {v: k for k, v in load_id.items() if v is not None}
+
+DIM = [load_id[l] for l, t in load_type.items()
+       if t == 4 and load_id[l] is not None]
+
+total_energy = {}
+duration = {}
+
+for _, row in df_types.iterrows():
+    lid = load_id[row.iloc[COL_LOAD]]
+    if lid is None:
+        continue
+    if int(row.iloc[COL_TYPE]) in [1, 2]:
+        total_energy[lid] = float(row.iloc[COL_TOTAL_ENERGY])
+        duration[lid]     = int(row.iloc[COL_DURATION])
+#  SHEET 2: BASE CONSUMPTION
+df_cons = pd.read_excel(file_pathh, sheet_name=2)
+df_cons.columns = [c.strip() for c in df_cons.columns]
+
+time = df_cons.iloc[:, 0].astype(int).tolist()
+loads_in_sheet2 = list(df_cons.columns[1:])
+sheet2_ids = []
+for c in loads_in_sheet2:
+    try:
+        sheet2_ids.append(extract_id(c))
+    except ValueError:
+        pass  # fixed load no ID
+
+base_consumption = {
+    (l, t): float(df_cons.loc[i, l])
+    for i, t in enumerate(time)
+    for l in loads_in_sheet2
+}
+
+unknown_ids = [
+    extract_id(c)
+    for c in loads_in_sheet2
+    if c[0].isdigit() and extract_id(c) not in (DL1 + DL2 + DIM)
+]
+
+if unknown_ids:
+    raise ValueError(
+        f"Sheet 2 references unknown LoadIDs: "
+        f"{[f'{i} - {id_to_name.get(i, 'UNKNOWN')}' for i in unknown_ids]}"
+)
+id_to_col_sheet2 = {
+    extract_id(c): c for c in loads_in_sheet2 if c[0].isdigit()
+}
+# CLASSIFICATION
+overridden_ids = [lid for lid in DL1 + DL2 if lid in sheet2_ids]
+
+if overridden_ids:
+    print("\n OVERRIDE: Deferrable loads forced to NON-DEFERRABLE (appear in Sheet 2):")
+    for lid in overridden_ids:
+        print(f"   {lid} - {id_to_name[lid]}")
+
+
+DL1 = [l for l in DL1 if l not in overridden_ids]
+DL2 = [l for l in DL2 if l not in overridden_ids]
+
+DL_all = DL1 + DL2
+total_energy = {l: total_energy[l] for l in DL_all}
+duration     = {l: duration[l]     for l in DL_all}
+
+FIXED_WITH_PROFILE = [
+    l for l in loads_in_sheet2
+    if not (l[0].isdigit() and extract_id(l) in DIM)
+]
+
+
+
+
+
+
+# SHEET 3: DEFERRABLE AVAILABILITY
+df_on = pd.read_excel(file_pathh, sheet_name=3)
+df_on.columns = [c.strip() for c in df_on.columns]
+
+availability = {
+    (extract_id(col), int(row.iloc[0])): int(row[col])
+    for _, row in df_on.iterrows()
+    for col in df_on.columns[1:]
+}
+
+availability = {
+    (l, t): v for (l, t), v in availability.items()
+    if l in DL1 or l in DL2
+}
+
+# SHEET 4: COMFORT
+df_comfort = pd.read_excel(file_pathh, sheet_name=4)
+df_comfort.columns = [c.strip() for c in df_comfort.columns]
+
+comfort = {
+    (extract_id(col), int(row.iloc[0])): float(row[col])
+    for _, row in df_comfort.iterrows()
+    for col in df_comfort.columns[1:]
+}
+
+
+# SHEET 5: DIMMABLE REDUCTION
+df_dim = pd.read_excel(file_pathh, sheet_name=5)
+df_dim.columns = [c.strip() for c in df_dim.columns]
+
+dim_reduction = {}
+
+for _, row in df_dim.iterrows():
+    t = int(row.iloc[0])
+    for col in df_dim.columns[1:]:
+        if col[0].isdigit():
+            lid = extract_id(col)
+            if lid in DIM:
+                dim_reduction[(lid, t)] = float(row[col])
+
+loads_in_sheet2 = [l.strip() for l in loads_in_sheet2]
+
+
+
+missing_dim = [l for l in DIM if l not in sheet2_ids]
+
+if missing_dim:
+    raise ValueError(
+        f"DIMMABLE loads must appear in Sheet 2: "
+        f"{[id_to_name[l] for l in missing_dim]}"
+    )
+
+
+comfort = {
+    (l, t): v for (l, t), v in comfort.items()
+    if l in DL1 or l in DL2 or l in DIM
+}
+
+#check for missmatch
+missing_comfort_def = [
+    l for l in DL1 + DL2
+    if not any((l, t) in comfort for t in time)
+]
+
+if missing_comfort_def:
+    raise ValueError(
+        f" Deferrable loads missing comfort values (Sheet 4): {missing_comfort_def}"
+    )
+missing_availability = [
+    l for l in DL1 + DL2
+    if not any((l, t) in availability for t in time)
+]
+
+if missing_availability:
+    raise ValueError(
+        f" Deferrable loads missing availability (Sheet 3): {missing_availability}"
+    )
+if missing_dim:
+    raise ValueError(
+        f" DIM loads missing in Sheet 2 (no base consumption defined): {missing_dim}"
+    )
+missing_comfort_dim = [
+    l for l in DIM
+    if not any((l, t) in comfort for t in time)
+]
+
+if missing_comfort_dim:
+    raise ValueError(
+        f" DIM loads missing comfort values (Sheet 4): {missing_comfort_dim}"
+    )
+
+missing_dim_reduction = [
+    l for l in DIM
+    if not any((l, t) in dim_reduction for t in time)
+]
+
+if missing_dim_reduction:
+    raise ValueError(
+        f" DIM loads missing dimming percentages (Sheet 5): {missing_dim_reduction}"
+    )
+
+missing_duration = [l for l in DL1 + DL2 if l not in duration]
+if missing_duration:
+    raise ValueError(
+        f" Deferrable loads missing duration (Sheet 1): {missing_duration}"
+    )
+
+missing_energy = [l for l in DL1 + DL2 if l not in total_energy]
+if missing_energy:
+    raise ValueError(
+        f" Deferrable loads missing total energy (Sheet 1): {missing_energy}"
+    )
+
+
+
+
+
+#  Read vehicle sheets
+first_vehicle_sheet = 6
+vehicles_data = []
+for vehicle_num in range(1, num_veiculos + 1):
+    sheet_index = first_vehicle_sheet + (vehicle_num - 1)
+    df_veiculo = pd.read_excel(file_pathh, sheet_name=sheet_index)
+
+    vehicle_data = {
+        'full_tank': float(df_veiculo.iloc[0, 5]),
+        'energia_inicial': (float(df_veiculo.iloc[0, 5]) * df_veiculo.iloc[:, 1].astype(float)).tolist(),
+        'energia_minima': (float(df_veiculo.iloc[0, 5]) * df_veiculo.iloc[:, 2].astype(float)).tolist(),
+        'gasto_energia_veiculo': df_veiculo.iloc[:, 3].astype(float).tolist(),
+        'disponibilidade': df_veiculo.iloc[:, 4].astype(float).tolist(),
+        'capacidade_bateria': float(df_veiculo.iloc[0, 5]),
+        'ev_discharge_limit': float(df_veiculo.iloc[0, 6]),
+        'charge_limit': float(df_veiculo.iloc[0, 7]),
+        'min_soc_v2x' : float(df_veiculo.iloc[0, 8]),
+        'pen_vei_bat': float(df_veiculo.iloc[0, 9])
+    }
+    vehicles_data.append(vehicle_data)
+    print(f"Vehicle {vehicle_num}: full_tank={vehicle_data['full_tank']}, charge_limit={vehicle_data['charge_limit']}, ev_discharge_limit={vehicle_data['ev_discharge_limit']}")
+
+print(f"Vehicle sheet {vehicle_num} -> {len(df_veiculo.columns)} columns")
+print(df_veiculo.columns)
+
+print(df_veiculo.columns)
+print(len(df_veiculo.columns))
+
+print("\n--- Debugging Vehicle Data ---")
+for v in range(num_veiculos):
+    print(f"Vehicle {v+1}:")
+    print(f"  Full tank: {vehicles_data[v]['full_tank']}")
+    print(f"  Initial energy: {vehicles_data[v]['energia_inicial'][0]}")
+    print(f"  Charge limit: {vehicles_data[v]['charge_limit']}")
+    print(f"  Penalization vei: {vehicles_data[v]['pen_vei_bat']}")
+    print(f"  V2X factor: {vehicles_data[v]['min_soc_v2x']}")
+print("------------------------------\n")
+
+
+print("Loads in Sheet 2:", loads_in_sheet2)
+
+
+m = pe.ConcreteModel()
+
+print("DL1 =", DL1)
+print("DL2 =", DL2)
+print("DL_all =", DL_all)
+print("total_energy =", total_energy)
+print("duration =", duration)
+
+# Conjuntos
+m.time = pe.Set(initialize=vetor_horas)
+m.vehicles = pe.Set(initialize=range(1, num_veiculos + 1))
+m.chargers = pe.Set(initialize=range(1, num_carregadores + 1))
+m.LOADS_FIXED = pe.Set(initialize=FIXED_WITH_PROFILE)
+# Parâmetros
+m.cost = pe.Param(m.time, within=pe.NonNegativeReals, initialize={t: float(vetor_precos[i]) for i, t in enumerate(vetor_horas)})
+m.solar = pe.Param(m.time, within=pe.NonNegativeReals,initialize={t: float(vetor_energiaPV[i]) for i, t in enumerate(vetor_horas)})
+m.sell_price = pe.Param(m.time, initialize={t: float(sell_price_data[i]) for i,t in enumerate(vetor_horas)})
+
+
+# Parâmetros dos veículos
+def init_vehicle_capacity(m, v):
+    return vehicles_data[v-1]['capacidade_bateria']
+m.vehicle_capacity = pe.Param(m.vehicles, initialize=init_vehicle_capacity)
+
+def init_initial_energy(m, v, t):
+    idx = vetor_horas.index(t)
+    return vehicles_data[v-1]['energia_inicial'][idx]
+m.initial_energy = pe.Param(m.vehicles, m.time, initialize=init_initial_energy)
+
+def init_min_energy(m, v, t):
+    idx = vetor_horas.index(t)
+    return vehicles_data[v-1]['energia_minima'][idx]
+m.min_energy = pe.Param(m.vehicles, m.time, initialize=init_min_energy)
+
+def init_available(m, v, t):
+    idx = vetor_horas.index(t)
+    return vehicles_data[v-1]['disponibilidade'][idx]
+m.available = pe.Param(m.vehicles, m.time, initialize=init_available)
+
+def init_gasto(m, v, t):
+    idx = vetor_horas.index(t)
+    return vehicles_data[v-1]['gasto_energia_veiculo'][idx]
+m.gasto = pe.Param(m.vehicles, m.time, initialize=init_gasto)
+
+def init_full_tank(m, v):
+    return vehicles_data[v-1]['full_tank']
+m.full_tank = pe.Param(m.vehicles, initialize=init_full_tank)
+
+def init_charge_limit(m, v):
+    return vehicles_data[v-1]['charge_limit']
+m.charge_limit_param = pe.Param(m.vehicles, initialize=init_charge_limit)
+
+def init_ev_discharge_limit(m, v):
+    return vehicles_data[v-1]['ev_discharge_limit']
+m.ev_discharge_limit_param = pe.Param(m.vehicles, initialize=init_ev_discharge_limit)
+
+def init_min_soc_v2x(m, v):
+    return vehicles_data[v-1]['min_soc_v2x']
+m.min_soc_v2x = pe.Param(m.vehicles, initialize=init_min_soc_v2x)
+
+def init_pen_vei_bat(m, v):
+    return vehicles_data[v-1]['pen_vei_bat']
+
+m.pen_vei_bat = pe.Param(m.vehicles, within=pe.NonNegativeReals, initialize=init_pen_vei_bat)
+
+# VARIÁVEIS DE DECISÃO
+# House energy variables
+m.house_demand = pe.Var(m.time, domain=pe.NonNegativeReals)
+m.casa_from_grid = pe.Var(m.time, domain=pe.NonNegativeReals, bounds=(0, None))
+m.casa_from_pv = pe.Var(m.time, domain=pe.NonNegativeReals, bounds=(0, None))
+m.casa_from_batt = pe.Var(m.time, domain=pe.NonNegativeReals, bounds=(0, None))
+m.casa_from_ev = pe.Var(m.vehicles, m.time, domain=pe.NonNegativeReals, bounds=(0, None))
+
+# EV charging variables
+m.charge_solar = pe.Var(m.vehicles, m.time, domain=pe.NonNegativeReals)
+m.charge_grid = pe.Var(m.vehicles, m.time, domain=pe.NonNegativeReals)
+m.energy = pe.Var(m.vehicles, m.time, domain=pe.NonNegativeReals)
+m.ev_charging = pe.Var(m.vehicles, m.time, within=pe.Binary)
+m.ev_discharging = pe.Var(m.vehicles, m.time, within=pe.Binary)
+
+# V2X variables
+m.discharge_grid = pe.Var(m.vehicles, m.time, domain=pe.NonNegativeReals, bounds=(0, 2.5))
+m.v2x_active = pe.Var(m.vehicles, m.time, within=pe.Binary)
+
+# Charger assignment
+m.vehicle_charger_assignment = pe.Var(m.vehicles, m.chargers, m.time, domain=pe.Binary)
+
+# Bateria fixa
+m.bateria_capacidade_max = pe.Param(within=pe.NonNegativeReals, initialize=bateria_capacidade_max_value)
+m.bateria_potencia_max = pe.Param(within=pe.NonNegativeReals, initialize=bateria_potencia_max_value)
+m.bateria_energia = pe.Var(m.time, domain=pe.NonNegativeReals)
+m.bateria_carga = pe.Var(m.time, domain=pe.NonNegativeReals, bounds=(0, m.bateria_potencia_max))
+m.bateria_descarga = pe.Var(m.time, domain=pe.NonNegativeReals, bounds=(0, m.bateria_potencia_max))
+m.bateria_descarga_grid = pe.Var(m.time, domain=pe.NonNegativeReals, bounds=(0, m.bateria_potencia_max))
+
+# EV charging from HOME battery
+m.ev_charge_from_home_batt = pe.Var(m.vehicles, m.time, domain=pe.NonNegativeReals, bounds=(0, m.bateria_potencia_max))
+
+# PV grid
+m.pv_to_grid = pe.Var(m.time, domain=pe.NonNegativeReals)
+
+#Loads
+
+# Deferrable
+m.DL1 = pe.Set(initialize=DL1)
+m.DL2 = pe.Set(initialize=DL2)
+m.DL1_active = pe.Var(m.DL1, m.time, within=pe.Binary)
+m.DL1_start = pe.Var(m.DL1, m.time, within=pe.Binary)
+m.DL2_active = pe.Var(m.DL2, m.time, within=pe.Binary)
+m.DL = pe.Set(initialize=DL_all)
+
+m.total_energy = pe.Param(m.DL, initialize=total_energy)
+m.duration     = pe.Param(m.DL, initialize=duration)
+missing = [l for l in DL1 + DL2 if l not in duration]
+
+
+
+# Dimmable
+m.DIM = pe.Set(initialize=DIM)
+m.DIM_on = pe.Var(m.DIM, m.time, within=pe.Binary)
+m.DIM_level = pe.Var(m.DIM, m.time, bounds=(0,1))
+
+#Fixed
+m.LOADS_ALL = pe.Set(initialize=loads_in_sheet2)
+
+m.base_load = pe.Param(
+    m.time,
+    m.LOADS_ALL,
+    initialize=lambda m, t, l: base_consumption.get((l, t), 0.0),
+    within=pe.NonNegativeReals
+)
+EPS = 1e-6  # safety but not critical if dim_reduction never small
+
+# FUNÇÃO OBJETIVO
+obj_expr = (
+    sum(m.cost[t] * sum(m.charge_grid[v, t] for v in m.vehicles) for t in m.time)
+    +sum(m.cost[t] * m.casa_from_grid[t] for t in m.time)
+    +sum(penalização_bateria_arm * m.bateria_descarga[t] for t in m.time)
+    -sum(m.sell_price[t] * sum(m.discharge_grid[v, t] for v in m.vehicles) for t in m.time)
+    -sum(m.sell_price[t] * m.bateria_descarga_grid[t] for t in m.time)
+    -sum(m.sell_price[t] * m.pv_to_grid[t] for t in m.time)
+)
+
+obj_expr += sum(
+   m.pen_vei_bat[v] * m.casa_from_ev[v, t]
+    for v in m.vehicles
+    for t in m.time
+)
+
+obj_expr += sum(
+   m.pen_vei_bat[v] * m.discharge_grid[v, t]
+    for v in m.vehicles
+    for t in m.time
+)
+
+#conforto deferrable
+obj_expr += sum(comfort.get((l, t), 0.0)* m.DL1_active[l, t]for l in m.DL1 for t in m.time)
+
+obj_expr += sum(comfort.get((l, t), 0.0) * m.DL2_active[l, t]for l in m.DL2 for t in m.time)
+
+# conforto dimm
+obj_expr += sum(
+   m.base_load[t,id_to_col_sheet2[l]]* comfort.get((l,t),0) *(m.DIM_level[l,t] / dim_reduction.get((l,t),0)
+   + EPS)
+   for l in m.DIM for t in m.time
+)
+
+
+
+m.obj = pe.Objective(expr=obj_expr, sense=pe.minimize)
+
+# RESTRIÇÕES
+# Restrição 1 (a), (b): Equilibrio de energia da casa
+def define_house_demand(m, t):
+
+    fixed = sum(m.base_load[t, l] for l in m.LOADS_FIXED)
+
+    dl1 = sum(
+        (m.total_energy[l] / m.duration[l]) * m.DL1_active[l, t]
+        for l in m.DL1
+    )
+
+    dl2 = sum(
+        (m.total_energy[l] / m.duration[l]) * m.DL2_active[l, t]
+        for l in m.DL2
+    )
+
+    dim = sum(
+    m.base_load[t, id_to_col_sheet2[l]] * (1 - m.DIM_level[l,t])
+    for l in m.DIM
+    )
+
+    return m.house_demand[t] == fixed + dl1 + dl2 + dim
+m.house_demand_def = pe.Constraint(m.time, rule=define_house_demand)
+
+def house_supply_balance(m, t):
+    supply = sum(m.casa_from_ev[v, t] for v in m.vehicles) + m.casa_from_grid[t] + m.casa_from_pv[t] + m.casa_from_batt[t]
+    return supply == m.house_demand[t]
+m.casa_balance = pe.Constraint(m.time, rule=house_supply_balance)
+
+
+
+
+# Restrição 2 a)/b): Trocas de energia da bateria fixa
+def bateria_acumulada(m, t):
+    if t == m.time.first():
+        return m.bateria_energia[t] == (
+            m.bateria_carga[t] -
+            m.casa_from_batt[t] -
+           sum(m.ev_charge_from_home_batt[v, t] for v in m.vehicles) -
+            m.bateria_descarga_grid[t]
+        )
+    else:
+        anterior = list(m.time.ordered_data())[list(m.time.ordered_data()).index(t)-1]
+        return m.bateria_energia[t] == (
+            m.bateria_energia[anterior] +
+            m.bateria_carga[t] -
+            m.casa_from_batt[t] -
+            sum(m.ev_charge_from_home_batt[v, t] for v in m.vehicles) -
+            m.bateria_descarga_grid[t]
+        )
+m.bateria_acumulada = Constraint(m.time, rule=bateria_acumulada)
+
+def bateria_descarga_total(m, t):
+    return m.bateria_descarga[t] == (
+        m.casa_from_batt[t] +
+          sum(m.ev_charge_from_home_batt[v, t] for v in m.vehicles)  +
+        m.bateria_descarga_grid[t]
+    )
+m.bateria_descarga_total = Constraint(m.time, rule=bateria_descarga_total)
+
+# Restrição 3: Carga máxima da bateria fixa
+def bateria_capacidade_maxima(m, t):
+    return m.bateria_energia[t] <= m.bateria_capacidade_max
+m.bateria_capacidade_maxima = Constraint(m.time, rule=bateria_capacidade_maxima)
+
+def battery_power_limit(m, t):
+    return m.bateria_carga[t] <= m.bateria_potencia_max
+
+m.battery_power_limit = Constraint(m.time, rule=battery_power_limit)
+
+# Restrição 4 a)/b): Atribuição de carregadores
+def charger_assignment(m, v, t):
+    return sum(m.vehicle_charger_assignment[v, c, t] for c in m.chargers) <= 1
+m.charger_assignment_constraint = Constraint(m.vehicles, m.time, rule=charger_assignment)
+
+def max_vehicles_per_charger(m, c, t):
+    return sum(m.vehicle_charger_assignment[v, c, t] for v in m.vehicles) <= 1
+m.max_vehicles_per_charger = Constraint(m.chargers, m.time, rule=max_vehicles_per_charger)
+
+# Restrição 5: Carregar ou descarregar apenas quando disponível e com carregador
+def ev_charge_only_when_home(m, v, t):
+    M = 1000
+    charger_assigned = sum(m.vehicle_charger_assignment[v, c, t] for c in m.chargers)
+
+    return (m.charge_grid[v, t] +
+            m.charge_solar[v, t] +
+            m.ev_charge_from_home_batt[v, t] +
+            m.discharge_grid[v, t] +
+            m.casa_from_ev[v, t]) <= M * m.available[v, t] * charger_assigned
+
+m.ev_charge_only_when_home = Constraint(m.vehicles, m.time, rule=ev_charge_only_when_home)
+
+
+# Restrição 6: Limitar energia do PV
+def limite_solar_corrigido(m, t):
+    return (
+        m.casa_from_pv[t]
+        + m.bateria_carga[t]
+        + sum(m.charge_solar[v, t] for v in m.vehicles)
+        + m.pv_to_grid[t]
+        == m.solar[t]
+    )
+m.restricao_solar_corrigida = Constraint(m.time, rule=limite_solar_corrigido)
+# Restrição 7: a) Carga no EV /  b) c) d) carrega ou descarrega
+def energy_accumulation_rule(m, v, t):
+    if t == m.time.first():
+        return m.energy[v, t] == (
+            m.initial_energy[v, t] +
+            m.charge_grid[v, t] + m.charge_solar[v, t] + m.ev_charge_from_home_batt[v, t] -
+            m.gasto[v, t] -
+            m.discharge_grid[v, t] -
+            m.casa_from_ev[v, t]
+
+        )
+    else:
+        prev = list(m.time.ordered_data())[list(m.time.ordered_data()).index(t) - 1]
+        return m.energy[v, t] == (
+            m.energy[v, prev] +
+            m.charge_grid[v, t] + m.charge_solar[v, t] + m.ev_charge_from_home_batt[v, t] -
+            m.gasto[v, t] -
+            m.discharge_grid[v, t]-
+            m.casa_from_ev[v, t]
+        )
+m.energy_accumulation = Constraint(m.vehicles, m.time, rule=energy_accumulation_rule)
+
+def ev_mode_exclusivity(m, v, t):
+    return m.ev_charging[v, t] + m.ev_discharging[v, t] <= 1
+m.ev_mode_exclusivity = Constraint(m.vehicles, m.time, rule=ev_mode_exclusivity)
+
+def ev_charging_link(m, v, t):
+    M = m.charge_limit_param[v]
+    return (
+        m.charge_grid[v, t]
+        + m.charge_solar[v, t]
+        + m.ev_charge_from_home_batt[v, t]
+        <= M * m.ev_charging[v, t]
+    )
+m.ev_charging_link = Constraint(m.vehicles, m.time, rule=ev_charging_link)
+
+def ev_discharging_link(m, v, t):
+    M = m.ev_discharge_limit_param[v]
+    return (
+        m.discharge_grid[v, t]
+        + m.casa_from_ev[v, t]
+        <= M * m.ev_discharging[v, t]
+    )
+m.ev_discharging_link = Constraint(m.vehicles, m.time, rule=ev_discharging_link)
+
+# Restrição 8: Energia mínima necessária
+def demand_energy_rule(m, v, t):
+    return m.energy[v, t] >= m.min_energy[v, t]
+m.demand_energy_constraint = Constraint(m.vehicles, m.time, rule=demand_energy_rule)
+
+# Restrição 9: Limite da capacidade da bateria
+def limite_capacidade_bateria(m, v, t):
+    return m.energy[v, t] <= m.full_tank[v]
+m.limite_capacidade_bateria = Constraint(m.vehicles, m.time, rule=limite_capacidade_bateria)
+
+# Restrição 10 a)/b): Venda de energia da bateria fixa
+def bateria_descarga_grid_limite(m, t):
+    return m.bateria_descarga_grid[t] <= m.bateria_energia[t]
+m.bateria_descarga_grid_constraint_energy = Constraint(m.time, rule=bateria_descarga_grid_limite)
+
+def bateria_descarga_grid_potencia_limite(m, t):
+    return m.bateria_descarga_grid[t] <= m.bateria_potencia_max
+m.bateria_descarga_grid_constraint_power = Constraint(m.time, rule=bateria_descarga_grid_potencia_limite)
+
+# Restrição 11 a)/b)/c): V2X activation
+def min_soc_v2x_constraint_strong(m, v, t):
+    total_discharge = m.discharge_grid[v, t] + m.casa_from_ev[v, t]
+    M = 1000
+    # Big-M method: if discharging, SOC must be above minimum
+    return m.energy[v, t] >= m.min_soc_v2x[v] * m.vehicle_capacity[v] - M * (1 - m.v2x_active[v, t])
+m.min_soc_v2x_constraint_strong = Constraint(m.vehicles, m.time, rule=min_soc_v2x_constraint_strong)
+
+def force_v2x_active(m, v, t):
+    total_discharge = m.discharge_grid[v, t] + m.casa_from_ev[v, t]
+    M = 1000
+    return total_discharge <= M * m.v2x_active[v, t]
+m.force_v2x_active = Constraint(m.vehicles, m.time, rule=force_v2x_active)
+
+# If min_soc_v2x == 1, no V2X
+def no_v2x_when_min_soc_is_1(m, v, t):
+    if m.min_soc_v2x[v] == 1.0:
+        return m.discharge_grid[v, t] + m.casa_from_ev[v, t] == 0
+    return Constraint.Skip
+m.no_v2x_when_min_soc_is_1 = Constraint(m.vehicles, m.time, rule=no_v2x_when_min_soc_is_1)
+
+
+
+# Restrição 13: Limite carregamento do EV
+def constant_charging_limit(m, v, t):
+    total_charge = (
+        m.charge_grid[v, t] +
+        m.charge_solar[v, t] +
+        m.ev_charge_from_home_batt[v, t]
+    )
+    return total_charge <= m.charge_limit_param[v]
+m.constant_charging_limit = Constraint(m.vehicles, m.time, rule=constant_charging_limit)
+
+# Restrição 14: Limite V2X
+def ev_discharge_limit_rule(m, v, t):
+    return m.discharge_grid[v, t] <= m.ev_discharge_limit_param[v]
+m.ev_discharge_limit_constraint = Constraint(m.vehicles, m.time, rule=ev_discharge_limit_rule)
+
+# Restrição 15: Deferrable loads
+
+# Type 2 a)/b)/c)/d)/e)/f)
+def duration_rule(m, l):
+    return sum(m.DL1_active[l, t] for t in m.time) == m.duration[l]
+m.DL1_duration = pe.Constraint(m.DL1, rule=duration_rule)
+
+def energy_rule_DL1(m, l):
+    power = m.total_energy[l] / m.duration[l]
+    return sum(power * m.DL1_active[l, t] for t in m.time) == m.total_energy[l]
+
+m.DL1_energy = pe.Constraint(m.DL1, rule=energy_rule_DL1)
+
+
+def DL1_availability(m, l, t):
+    return m.DL1_active[l, t] <= availability.get((l, t), 1)
+m.DL1_availability = pe.Constraint(m.DL1, m.time, rule=DL1_availability)
+
+
+def DL1_start_link(m, l, t):
+    times = list(m.time.ordered_data())
+    i = times.index(t)
+
+    if i == 0:
+        return m.DL1_start[l, t] >= m.DL1_active[l, t]
+    else:
+        return m.DL1_start[l, t] >= m.DL1_active[l, t] - m.DL1_active[l, times[i-1]]
+
+m.DL1_start_link = pe.Constraint(m.DL1, m.time, rule=DL1_start_link)
+
+def DL1_single_start(m, l):
+    return sum(m.DL1_start[l, t] for t in m.time) == 1
+
+m.DL1_single_start = pe.Constraint(m.DL1, rule=DL1_single_start)
+
+def DL1_continuity(m, l, t):
+    dur = int(m.duration[l])
+    times = list(m.time.ordered_data())
+    i = times.index(t)
+
+    if i + dur > len(times):
+        return pe.Constraint.Skip
+
+    return sum(
+        m.DL1_active[l, times[i+k]]
+        for k in range(dur)
+    ) >= dur * m.DL1_start[l, t]
+
+m.DL1_continuity = pe.Constraint(m.DL1, m.time, rule=DL1_continuity)
+
+
+# Type 2 a)/b)/c)
+
+def energy_rule_DL2(m, l):
+    power = m.total_energy[l] / m.duration[l]
+    return sum(power * m.DL2_active[l, t] for t in m.time) == m.total_energy[l]
+
+m.DL2_energy = pe.Constraint(m.DL2, rule=energy_rule_DL2)
+
+def duration_rule2(m, l):
+    return sum(m.DL2_active[l, t] for t in m.time) == m.duration[l]
+m.DL2_duration = pe.Constraint(m.DL2, rule=duration_rule2)
+
+def DL2_availability(m, l, t):
+    return m.DL2_active[l, t] <= availability.get((l, t), 1)
+m.DL2_availability = pe.Constraint(m.DL2, m.time, rule=DL2_availability)
+
+# Type 4 DIM a)/b)/c)
+DIM_MIN = 0.05  # 5%
+
+def dim_min_rule(m, l, t):
+    return m.DIM_level[l, t] >= DIM_MIN * m.DIM_on[l, t]
+m.dim_min_constraint = pe.Constraint(m.DIM, m.time, rule=dim_min_rule)
+
+
+def dim_max_rule(m, l, t):
+    return m.DIM_level[l,t] <= dim_reduction[(l,t)] * m.DIM_on[l,t]
+m.dim_max_constraint = Constraint(m.DIM, m.time, rule=dim_max_rule)
+
+print("\n---- COMFORT INPUT (Sheet 4) ----")
+
+for l in DIM:
+    print(f"\nLoad {l} ({id_to_name[l]})")
+    for t in time:
+        print(t, comfort[(l,t)])
+
+print("DL1:", DL1)
+print("DL2:", DL2)
+print("DIM:", DIM)
+
+# SOLUÇÃO DO MODELO
+opt = SolverFactory("appsi_highs")
+results = opt.solve(m, tee=True)
+
+#comfort cost calculation
+comfort_cost_DL = sum(
+    comfort.get((l,t),0) * pe.value(m.DL1_active[l,t])
+    for l in m.DL1 for t in m.time
+) + sum(
+    comfort.get((l,t),0) * pe.value(m.DL2_active[l,t])
+    for l in m.DL2 for t in m.time
+)
+
+comfort_cost_DIM = sum(
+    pe.value(m.base_load[t, id_to_col_sheet2[l]]) *
+    comfort.get((l,t),0) *
+    (pe.value(m.DIM_level[l,t]) / dim_reduction[(l,t)])
+    for l in m.DIM for t in m.time
+)
+
+total_comfort_cost = comfort_cost_DL + comfort_cost_DIM
+
+print("CHECK ENERGY CONSERVATION")
+
+pv_used = sum(pe.value(m.casa_from_pv[t] + m.bateria_carga[t] + m.pv_to_grid[t] +
+             sum(m.charge_solar[v,t] for v in m.vehicles)) for t in m.time)
+
+pv_gen = sum(vetor_energiaPV)
+
+print("PV gen:", pv_gen)
+print("PV used:", pv_used)
+
+print("---- DIM DEBUG ----")
+for l in m.DIM:
+    for t in m.time:
+        if pe.value(m.DIM_on[l,t]) > 0.5:
+            print(l, t, "DIM =", pe.value(m.DIM_level[l,t]),
+                  "Reduction =", dim_reduction[(l,t)])
+
+print("TOTAL HOUSE DEMAND:",
+      sum(pe.value(m.house_demand[t]) for t in m.time))
+# SALVAR RESULTADOS
+resultados = {}
+
+# Save vehicle-specific data
+for v in m.vehicles:
+    dados = {
+        "Time (h)": [],
+        "Grid-to-EV (kW)": [],
+        "PV-to-EV (kW)": [],
+        "BESS-to-EV (kW)": [],
+        "EV SoC (kWh)": [],
+        "EV Driving Energy Consumption (kWh)": [],
+        "EV-to-grid (kW)": [],
+        "Ev-to-House (kW)": [],
+        "Chosen charger": [],
+        "Availability": [],
+        "Minimum departure SoC (kWh)": [],
+    }
+
+    for t in m.time:
+        charger_assigned = None
+        for c in m.chargers:
+            if pe.value(m.vehicle_charger_assignment[v, c, t]) > 0.5:
+                charger_assigned = c
+                break
+
+        dados["Time (h)"].append(t)
+        dados["Grid-to-EV (kW)"].append(pe.value(m.charge_grid[v, t]))
+        dados["PV-to-EV (kW)"].append(pe.value(m.charge_solar[v, t]))
+        dados["BESS-to-EV (kW)"].append(pe.value(m.ev_charge_from_home_batt[v, t]))
+        dados["EV SoC (kWh)"].append(pe.value(m.energy[v, t]))
+        dados["EV Driving Energy Consumption (kWh)"].append(pe.value(m.gasto[v, t]))
+        dados["EV-to-grid (kW)"].append(pe.value(m.discharge_grid[v, t]))
+        dados["Ev-to-House (kW)"].append(pe.value(m.casa_from_ev[v,t]))
+        dados["Chosen charger"].append(charger_assigned)
+        dados["Availability"].append(pe.value(m.available[v, t]))
+        dados["Minimum departure SoC (kWh)"].append(pe.value(m.min_energy[v, t]))
+    resultados[f"Veiculo_{v}"] = pd.DataFrame(dados)
+
+# Save common data
+dados_comuns = {
+    "Time (h)": [],
+    "PV generation (kW)": [],
+    "PV-to-BESS (kW)": [],
+    "BESS SoC (kWh)": [],
+    "Total house energy consumption (kW)": [],
+    "BESS-to-EV (kW)": [],
+    "PV-to-EV (kW)": [],
+    "Grid-to-EV (kW)": [],
+    "Ev-to-House (kW)": [],
+    "Grid-to-House (kW)": [],
+    "PV-to-House (kW)": [],
+    "BESS-to-House (kW)": [],
+    "BESS-to-grid (kW)": [],
+    "EV-to-grid (kW)": [],
+    "PV-to-grid (kW)": [],
+}
+
+if DL1:
+    for l in DL1:
+        dados_comuns[f"DL1_{id_to_name[l]}_active"] = []
+if DL2:
+    for l in DL2:
+        dados_comuns[f"DL2_{id_to_name[l]}_active"] = []
+if DIM:
+    for d in DIM:
+        dados_comuns[f"DIM_{id_to_name[d]}_on"] = []
+        dados_comuns[f"DIM_{id_to_name[d]}_level"] = []
+
+for t in m.time:
+    dados_comuns["Time (h)"].append(t)
+    dados_comuns["PV generation (kW)"].append(pe.value(m.solar[t]))
+    dados_comuns["PV-to-BESS (kW)"].append(pe.value(m.bateria_carga[t]))
+    dados_comuns["BESS SoC (kWh)"].append(pe.value(m.bateria_energia[t]))
+    dados_comuns["Total house energy consumption (kW)"].append(pe.value(m.house_demand[t]))
+    dados_comuns["BESS-to-EV (kW)"].append(pe.value(m.ev_charge_from_home_batt[v, t]))
+    dados_comuns["PV-to-EV (kW)"].append(pe.value(m.charge_solar[v, t]))
+    dados_comuns["Grid-to-EV (kW)"].append(pe.value(m.charge_grid[v, t]))
+    dados_comuns["Ev-to-House (kW)"].append(sum(pe.value(m.casa_from_ev[v,t]) for v in m.vehicles))
+    dados_comuns["Grid-to-House (kW)"].append(pe.value(m.casa_from_grid[t]))
+    dados_comuns["PV-to-House (kW)"].append(pe.value(m.casa_from_pv[t]))
+    dados_comuns["BESS-to-House (kW)"].append(pe.value(m.casa_from_batt[t]))
+    dados_comuns["BESS-to-grid (kW)"].append(pe.value(m.bateria_descarga_grid[t]))
+    dados_comuns["EV-to-grid (kW)"].append(sum(pe.value(m.discharge_grid[v,t]) for v in m.vehicles))
+    dados_comuns["PV-to-grid (kW)"].append(pe.value(m.pv_to_grid[t]))
+
+
+
+
+    if DL1:
+        for l in DL1:
+          dados_comuns[f"DL1_{id_to_name[l]}_active"].append(int(round(pe.value(m.DL1_active[l, t]))))
+    if DL2:
+        for l in DL2:
+            dados_comuns[f"DL2_{id_to_name[l]}_active"].append(int(round(pe.value(m.DL2_active[l, t]))))
+
+    if DIM:
+        for d in m.DIM:
+            dados_comuns[f"DIM_{id_to_name[d]}_on"].append(int(round(pe.value(m.DIM_on[d, t]))))
+            dados_comuns[f"DIM_{id_to_name[d]}_level"].append(pe.value(m.DIM_level[d, t]))
+
+import matplotlib.pyplot as plt
+
+# Save common data
+resultados["Dados_Comuns"] = pd.DataFrame(dados_comuns)
+df = resultados["Dados_Comuns"]
+
+# Objective
+
+df_obj = pd.DataFrame({
+    "Objective value (€)": [pe.value(m.obj)],
+    "Comfort cost (€)": [total_comfort_cost],
+    "DL comfort cost (€)": [comfort_cost_DL],
+    "DIM comfort cost (€)": [comfort_cost_DIM],
+})
+
+resultados["Objective"] = df_obj
+
+comfort_share = total_comfort_cost / pe.value(m.obj)
+print("Comfort share of objective:", comfort_share)
+# Save to Excel
+prefixo_nome = "resultados"
+drive_folder = "/content/drive/My Drive/Colab Notebooks/"
+
+existing_files = glob.glob(os.path.join(drive_folder, f"{prefixo_nome}*.xlsx"))
+if existing_files:
+    existing_numbers = [
+        int(os.path.splitext(os.path.basename(f))[0].replace(prefixo_nome, ""))
+        for f in existing_files if os.path.splitext(os.path.basename(f))[0].replace(prefixo_nome, "").isdigit()
+    ]
+    next_number = max(existing_numbers) + 1
+else:
+    next_number = 1
+
+output_filename = f"{prefixo_nome}{next_number}.xlsx"
+output_path = os.path.join(drive_folder, output_filename)
+
+with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
+    for sheet_name, df in resultados.items():
+        df.to_excel(writer, sheet_name=sheet_name, index=False)
+
+print(f"\n✅ Resultados salvos em: {output_path}")
+print(f"✅ Número de veículos processados: {num_veiculos}")
+print(f"✅ Número de carregadores disponíveis: {num_carregadores}")
